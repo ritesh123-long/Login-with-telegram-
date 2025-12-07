@@ -1,150 +1,185 @@
 import os
 import random
-import string
-import time
-from datetime import datetime, timezone
-
 import requests
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from urllib.parse import quote_plus
+
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 # ==== CONFIG ====
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-SHEETDB_URL = os.environ.get("SHEETDB_URL", "https://sheetdb.io/api/v1/17v254fdw500k")
+BOT_TOKEN = os.environ.get(
+    "BOT_TOKEN",
+    "8137191289:AAHDXMoIf9TqEIpQ85z8VpUsnjnSuSZOLnk"  # yahan naya token daal dena
+)
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN env var set karo Render ke dashboard me.")
+# Apne Render wale URL se isko change karna
+BASE_URL = os.environ.get("BASE_URL", "https://example.onrender.com")
 
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+SHEETDB_URL = "https://sheetdb.io/api/v1/17v254fdw500k"
 
-# OTP store: { chat_id: {"otp": "123456", "expires_at": timestamp} }
-otp_store = {}
-
-
-def generate_otp(length: int = 6) -> str:
-    return "".join(random.choice(string.digits) for _ in range(length))
-
-
-def send_telegram_message(chat_id: int, text: str):
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-    }
-    resp = requests.post(TELEGRAM_API_URL, json=payload, timeout=10)
-    return resp
+OTP_TTL_MINUTES = 5  # OTP validity
+pending_otps = {}    # { chat_id: {otp, expires} }
 
 
-def current_time_str() -> str:
-    # ISO format time (UTC) – SheetDB me "time" column me yahi jayega
-    return datetime.now(timezone.utc).isoformat()
+# ==== HELPERS ====
 
 
-# ================== WEB ROUTES (OTP LOGIN) ==================
-
-
-@app.route("/")
-def index():
-    return "Telegram OTP service is running."
-
-
-@app.route("/tg/<int:chat_id>/", methods=["GET"])
-def send_otp(chat_id):
-    """
-    Step 1:
-    User /start ya /chat_id se apna chat_id le,
-    fir URL open kare:
-    https://your-service.onrender.com/tg/<chat_id>/
-    """
-    otp = generate_otp()
-    expires_at = time.time() + 5 * 60  # 5 minutes
-
-    otp_store[chat_id] = {
-        "otp": otp,
-        "expires_at": expires_at,
-    }
-
-    msg = f"Your login OTP is: {otp}\nThis OTP is valid for 5 minutes."
-    resp = send_telegram_message(chat_id, msg)
-
-    if not resp.ok:
-        return jsonify(
-            {
-                "login": "failed",
-                "error": "Failed to send OTP to Telegram",
-                "telegram_response": resp.text,
-            }
-        ), 400
-
-    return jsonify({"login": "pending", "message": "OTP sent to Telegram"})
-
-
-@app.route("/tg/<int:chat_id>/<otp>/", methods=["GET"])
-def verify_otp(chat_id, otp):
-    """
-    Step 2:
-    User same chat_id ke sath OTP verify kare:
-    https://your-service.onrender.com/tg/<chat_id>/<otp>/
-    """
-    record = otp_store.get(chat_id)
-
-    if not record:
-        return jsonify({"login": "failed", "error": "No OTP generated for this chat_id"}), 400
-
-    if time.time() > record["expires_at"]:
-        otp_store.pop(chat_id, None)
-        return jsonify({"login": "failed", "error": "OTP expired"}), 400
-
-    if otp != record["otp"]:
-        return jsonify({"login": "failed", "error": "Invalid OTP"}), 400
-
-    # OTP sahi hai – SheetDB me login entry create karo
-    login_time = current_time_str()
-    payload = {
-        "username": str(chat_id),  # NOTE: direct username + time (data[] nahi)
-        "time": login_time,
-    }
-
-    sheet_resp = requests.post(SHEETDB_URL, json=payload, timeout=10)
-
-    if not sheet_resp.ok:
-        return jsonify(
-            {
-                "login": "failed",
-                "error": "Failed to write to SheetDB",
-                "sheetdb_response": sheet_resp.text,
-            }
-        ), 500
-
-    # OTP ka record hata do
-    otp_store.pop(chat_id, None)
-
-    return jsonify(
-        {
-            "login": "successful",
-            "username": str(chat_id),
-            "time": login_time,
-        }
+def send_telegram_message(chat_id, text):
+    """Telegram pe simple text message bhejne ka helper."""
+    resp = requests.post(
+        f"{TELEGRAM_API}/sendMessage",
+        json={"chat_id": chat_id, "text": text}
     )
+    resp.raise_for_status()
+    return resp.json()
 
 
-# ================== TELEGRAM WEBHOOK (commands) ==================
+def get_chat_info(chat_id):
+    """Telegram se chat ke details (username, first_name, ...) nikalne ke liye."""
+    resp = requests.get(
+        f"{TELEGRAM_API}/getChat",
+        params={"chat_id": chat_id}
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("result", {})
+
+
+def get_login_key_from_chat(chat: dict) -> str:
+    """
+    SheetDB mein username column me kya save kare:
+    - agar Telegram username hai -> '@username'
+    - warna chat_id string
+    """
+    username = chat.get("username")
+    if username:
+        return f"@{username}"
+    return str(chat.get("id"))
+
+
+def get_ist_time_string():
+    ist = ZoneInfo("Asia/Kolkata")
+    now_ist = datetime.now(ist)
+    return now_ist.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def sheetdb_create_login_row(username_key: str):
+    """SheetDB me direct username + time POST karo (without data{})."""
+    payload = {
+        "username": username_key,
+        "time": get_ist_time_string(),
+    }
+    r = requests.post(SHEETDB_URL, json=payload)
+    r.raise_for_status()
+    return r.json()
+
+
+def sheetdb_is_logged_in(username_key: str) -> bool:
+    """SheetDB se check kare ki ye user login hai ya nahi."""
+    r = requests.get(
+        f"{SHEETDB_URL}/search",
+        params={"username": username_key}
+    )
+    r.raise_for_status()
+    data = r.json()
+    return len(data) > 0
+
+
+def sheetdb_delete_user(username_key: str) -> int:
+    """
+    SheetDB se user delete kare:
+    DELETE /api/v1/{API_ID}/username/{VALUE}
+    """
+    url = f"{SHEETDB_URL}/username/{quote_plus(username_key)}"
+    r = requests.delete(url)
+    r.raise_for_status()
+    data = r.json()
+    # response example: { "deleted": 1 }
+    return int(data.get("deleted", 0))
+
+
+# ==== FLASK ROUTES ====
+
+
+@app.route("/", methods=["GET"])
+def index():
+    return "Telegram OTP login backend is running."
+
+
+@app.route("/tg/<chat_id>", methods=["GET"])
+def send_otp(chat_id):
+    """Step 1: URL hit -> user ke chat_id pe OTP send karo."""
+    otp = f"{random.randint(0, 999999):06d}"
+    expires = datetime.utcnow() + timedelta(minutes=OTP_TTL_MINUTES)
+
+    pending_otps[chat_id] = {"otp": otp, "expires": expires}
+
+    try:
+        send_telegram_message(
+            chat_id,
+            f"🔐 Login OTP: {otp}\n"
+            f"Valid for {OTP_TTL_MINUTES} minutes."
+        )
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to send OTP to Telegram",
+            "details": str(e),
+        }), 400
+
+    return jsonify({"otp_sent": True, "chat_id": chat_id})
+
+
+@app.route("/tg/<chat_id>/<otp>", methods=["GET"])
+def verify_otp(chat_id, otp):
+    """Step 2: OTP verify karo, success pe SheetDB me row create karo."""
+    otp_entry = pending_otps.get(chat_id)
+
+    if not otp_entry:
+        return jsonify({"login": "failed", "reason": "no_otp_or_expired"}), 400
+
+    if datetime.utcnow() > otp_entry["expires"]:
+        pending_otps.pop(chat_id, None)
+        return jsonify({"login": "failed", "reason": "otp_expired"}), 400
+
+    if otp_entry["otp"] != otp:
+        return jsonify({"login": "failed", "reason": "wrong_otp"}), 400
+
+    try:
+        # Telegram se chat info le aao -> username ya chat_id
+        chat = get_chat_info(chat_id)
+        username_key = get_login_key_from_chat(chat)
+
+        # SheetDB me username + time store karo
+        sheetdb_create_login_row(username_key)
+
+        pending_otps.pop(chat_id, None)
+        return jsonify({"login": "successful", "username": username_key})
+    except Exception as e:
+        return jsonify({
+            "login": "failed",
+            "error": str(e),
+        }), 500
+
+
+# ==== TELEGRAM WEBHOOK (commands) ====
 
 
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def telegram_webhook():
     """
-    Telegram bot webhook endpoint.
-    Commands:
-      /start           -> chat_id batata hai + instructions
-      /chat_id         -> sirf chat_id batata hai
-      /login_status    -> SheetDB se check kar ke batata hai login stored hai ya nahi
-      /delete_account  -> SheetDB se username row delete karta hai
+    Telegram webhook:
+      - /start
+      - /chat_id
+      - /login_status
+      - /delete_account
     """
-
     update = request.get_json(force=True, silent=True) or {}
+    message = update.get("message") or update.get("edited_message")
 
-    message = update.get("message")
     if not message:
         return "ok"
 
@@ -152,96 +187,88 @@ def telegram_webhook():
     chat_id = chat.get("id")
     text = message.get("text", "").strip()
 
-    if chat_id is None or not text:
+    if not chat_id or not text:
         return "ok"
 
-    # Commands handle karo
-    if text.startswith("/start"):
-        reply = (
-            "Welcome!\n"
-            f"Your chat_id is: `{chat_id}`\n\n"
-            "Login karne ke liye:\n"
-            "1. Yeh URL browser me open karo:\n"
-            f"   https://YOUR_RENDER_URL/tg/{chat_id}/\n"
-            "2. Telegram me aapko OTP milega.\n"
-            "3. Fir yeh URL open karo (OTP ke sath):\n"
-            f"   https://YOUR_RENDER_URL/tg/{chat_id}/<OTP>/\n\n"
-            "Other commands:\n"
-            "/chat_id - apna chat id dekhne ke liye\n"
-            "/login_status - check karo login store hua ya nahi\n"
-            "/delete_account - account entry delete karne ke liye"
-        )
-        send_telegram_message(chat_id, reply)
-        return "ok"
+    # SheetDB key decide karo (username ya chat_id)
+    username_key = get_login_key_from_chat(chat)
 
-    if text.startswith("/chat_id"):
-        reply = f"Your chat_id is: `{chat_id}`"
-        send_telegram_message(chat_id, reply)
-        return "ok"
-
-    if text.startswith("/login_status"):
-        # SheetDB se search karo: /search?username=<chat_id>
-        try:
-            r = requests.get(
-                f"{SHEETDB_URL}/search",
-                params={"username": str(chat_id)},
-                timeout=10,
+    try:
+        if text.startswith("/start"):
+            login_url = f"{BASE_URL}/tg/{chat_id}"
+            send_telegram_message(
+                chat_id,
+                "👋 Welcome!\n\n"
+                f"Your chat ID: `{chat_id}`\n\n"
+                "Login steps:\n"
+                f"1️⃣ Browser me open kare: {login_url}\n"
+                "2️⃣ Bot tumhe OTP send karega\n"
+                "3️⃣ OTP verify URL open karo (website se call hoga)\n"
+                "4️⃣ Login ho jaoge ✅"
             )
-            if not r.ok:
-                send_telegram_message(
-                    chat_id,
-                    "SheetDB se data fetch karne me error aa gaya. Thodi der baad try karo.",
-                )
-                return "ok"
 
-            rows = r.json()
-            if isinstance(rows, list) and len(rows) > 0:
-                # Logged in
-                row = rows[0]
-                time_value = row.get("time", "unknown time")
+        elif text.startswith("/chat_id"):
+            login_url = f"{BASE_URL}/tg/{chat_id}"
+            send_telegram_message(
+                chat_id,
+                f"🆔 Your chat ID: `{chat_id}`\n\n"
+                f"Login URL: {login_url}"
+            )
+
+        elif text.startswith("/login_status"):
+            logged_in = sheetdb_is_logged_in(username_key)
+            if logged_in:
                 send_telegram_message(
                     chat_id,
-                    f"Login status: ✅ Logged in\nTime: {time_value}",
+                    f"✅ Login status: **LOGGED IN**\nUsername key: {username_key}"
                 )
             else:
                 send_telegram_message(
                     chat_id,
-                    "Login status: ❌ Not logged in (SheetDB me entry nahi mili).",
+                    "❌ Login status: NOT LOGGED IN\n"
+                    "Pehele login karne ke liye /start se URL lo aur browser me open karo."
                 )
-        except Exception as e:
-            send_telegram_message(chat_id, f"Error checking login status: {e}")
-        return "ok"
 
-    if text.startswith("/delete_account"):
-        # SheetDB delete: /username/<chat_id>
-        try:
-            r = requests.delete(
-                f"{SHEETDB_URL}/username/{chat_id}",
-                timeout=10,
-            )
-            if r.ok:
+        elif text.startswith("/delete_account"):
+            deleted = sheetdb_delete_user(username_key)
+            if deleted > 0:
                 send_telegram_message(
                     chat_id,
-                    "✅ Account delete ho gaya (SheetDB se entry hat gayi).",
+                    f"🗑️ Account deleted from SheetDB.\nUsername key: {username_key}"
                 )
             else:
                 send_telegram_message(
                     chat_id,
-                    f"❌ Account delete nahi ho paya. Response: {r.text}",
+                    "⚠️ SheetDB me tumhara koi record nahi mila."
                 )
-        except Exception as e:
-            send_telegram_message(chat_id, f"Error deleting account: {e}")
 
-        return "ok"
+        else:
+            send_telegram_message(
+                chat_id,
+                "Available commands:\n"
+                "/start - login info aur URL\n"
+                "/chat_id - apna chat ID aur login URL\n"
+                "/login_status - SheetDB se login status check\n"
+                "/delete_account - SheetDB se apna record delete"
+            )
 
-    # koi unknown text / command
-    send_telegram_message(
-        chat_id,
-        "Unknown command. Use /start, /chat_id, /login_status, or /delete_account.",
-    )
+    except Exception as e:
+        # Agar kuch bhi error aaye toh bhi webhook 200 return kare
+        try:
+            send_telegram_message(
+                chat_id,
+                f"⚠️ Internal error: {e}"
+            )
+        except Exception:
+            pass
+
     return "ok"
 
 
-# Render / gunicorn ke liye WSGI entrypoint
+# ==== ENTRYPOINT ====
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    # Render ke liye PORT env se lete hai
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
