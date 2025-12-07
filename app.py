@@ -1,156 +1,168 @@
 import os
-import time
 import random
 import string
-from datetime import datetime, timedelta
+from datetime import datetime
+
+import pytz
 import requests
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# ====== SETTINGS (env se lo, code me mat likho) ======
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-SHEETDB_URL = os.environ.get("SHEETDB_URL")
+# ---- CONFIG ----
 
-if not BOT_TOKEN or not SHEETDB_URL:
-    raise RuntimeError("Please set TELEGRAM_BOT_TOKEN and SHEETDB_URL environment variables")
+# Bot token ko environment variable me rakhna better hai
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
-# username -> {'otp': '123456', 'expires': 12345678}
-otp_store = {}
-OTP_EXPIRY_SECONDS = 300  # 5 minute
+# SheetDB API
+SHEETDB_URL = "https://sheetdb.io/api/v1/17v254fdw500k"
+
+# Memory me OTP store (simple use ke liye)
+otp_store = {}  # { "username_without_at": "123456" }
+
 
 def generate_otp(length=6):
-    return ''.join(random.choice("0123456789") for _ in range(length))
+    # Sirf digits ka OTP
+    return "".join(random.choices(string.digits, k=length))
 
 
-def send_telegram_otp(username, otp):
+def get_ist_time_string():
+    # India time (Asia/Kolkata)
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(ist)
+    return now.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def clean_username(raw_username: str) -> str:
     """
-    NOTE:
-    Yaha 'username' ko maine directly chat_id maana hai.
-    Agar aap @username use karoge, to pehle uska numeric chat_id nikalna padega
-    (bot se /start kara ke, getUpdates ya webhook se store karke).
-    Filhaal simple example ke liye direct chat_id use kar rahe hain.
+    URL se aane wale username ko normalize kare:
+    - agar '@' laga ho to hata de
     """
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    if raw_username.startswith("@"):
+        return raw_username[1:]
+    return raw_username
 
+
+def send_otp_to_telegram(username: str, otp: str):
+    """
+    Telegram pe OTP send kare.
+    Yaha `chat_id` me `@username` use kiya gaya hai.
+    """
+    chat_id = f"@{username}"  # yaha @username ka use ho raha hai
+    text = f"Your login OTP is: {otp}"
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": username,           # yaha username = chat_id assume kiya hai
-        "text": f"Your login OTP is: {otp}"
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
     }
-
     resp = requests.post(url, json=payload, timeout=10)
-    try:
-        data = resp.json()
-    except Exception:
-        data = {}
-
-    if not resp.ok or not data.get("ok", False):
-        # Debug ke liye error return kar dete hain
-        return False, data
-    return True, data
+    resp.raise_for_status()
+    return resp.json()
 
 
-def save_login_to_sheetdb(username):
-    # Time ko India (IST) me store kar rahe hain
-    ist_time = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    login_time_str = ist_time.strftime("%Y-%m-%d %H:%M:%S")
-
+def save_login_to_sheetdb(username: str):
+    """
+    ✅ IMPORTANT:
+    Yaha payload direct `{"username": "...", "time": "..."}` hai
+    `data` key BILKUL NAHI hai.
+    """
+    login_time = get_ist_time_string()
     payload = {
-        "data": [
-            {
-                "username": username,
-                "time": login_time_str
-            }
-        ]
+        "username": username,
+        "time": login_time
     }
-
     resp = requests.post(SHEETDB_URL, json=payload, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ----------- ROUTES -----------
+
+@app.route("/tg/<path:raw_username>/", methods=["GET"])
+def send_otp_route(raw_username):
+    """
+    URL: /tg/@username/
+    Kaam:
+      - username clean kare
+      - OTP generate kare
+      - Telegram pe bheje
+      - JSON response de
+    """
+    username = clean_username(raw_username)
+
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        return jsonify({
+            "error": "Telegram bot token not set on server"
+        }), 500
+
+    # OTP generate & store
+    otp = generate_otp()
+    otp_store[username] = otp
 
     try:
-        data = resp.json()
-    except Exception:
-        data = {}
-
-    if not resp.ok:
-        return False, data
-
-    return True, data
-
-
-@app.route("/")
-def index():
-    return jsonify({"status": "ok", "message": "Telegram OTP login backend"})
-
-
-# Step 1: /tg/<username>/  -> OTP send kare
-@app.route("/tg/<username>/", methods=["GET"])
-def send_otp_route(username):
-    # OTP generate
-    otp = generate_otp()
-
-    # memory me store karo (5 min ke liye)
-    otp_store[username] = {
-        "otp": otp,
-        "expires": time.time() + OTP_EXPIRY_SECONDS
-    }
-
-    ok, info = send_telegram_otp(username, otp)
-    if not ok:
+        telegram_res = send_otp_to_telegram(username, otp)
+    except Exception as e:
         return jsonify({
-            "status": "error",
-            "message": "Failed to send OTP to Telegram",
-            "details": info
+            "error": "Failed to send OTP to Telegram",
+            "details": str(e)
         }), 500
 
     return jsonify({
         "status": "otp_sent",
-        "username": username
+        "username": f"@{username}",
+        "message": "OTP sent to Telegram username",
+        "telegram_response_ok": telegram_res.get("ok", False)
     })
 
 
-# Step 2: /tg/<username>/<otp>/  -> OTP verify + SheetDB me save
-@app.route("/tg/<username>/<otp>/", methods=["GET"])
-def verify_otp_route(username, otp):
-    record = otp_store.get(username)
+@app.route("/tg/<path:raw_username>/<otp>", methods=["GET"])
+def verify_otp_route(raw_username, otp):
+    """
+    URL: /tg/@username/otp
+    Kaam:
+      - username clean kare
+      - otp compare kare
+      - sahi hua to SheetDB me username + time save kare
+      - JSON me login: successful return kare
+    """
+    username = clean_username(raw_username)
 
-    if not record:
+    # Check OTP
+    stored_otp = otp_store.get(username)
+    if stored_otp is None:
         return jsonify({
             "login": "failed",
-            "reason": "no_otp_for_user"
+            "reason": "no_otp_for_this_username"
         }), 400
 
-    # expiry check
-    if time.time() > record["expires"]:
-        otp_store.pop(username, None)
-        return jsonify({
-            "login": "failed",
-            "reason": "otp_expired"
-        }), 400
-
-    if otp != record["otp"]:
+    if otp != stored_otp:
         return jsonify({
             "login": "failed",
             "reason": "invalid_otp"
         }), 400
 
-    # OTP sahi hai, ek baar use hone ke baad hata do
-    otp_store.pop(username, None)
+    # OTP correct hai, use hata do (optional but better)
+    del otp_store[username]
 
-    # SheetDB me username + time save karo
-    ok, info = save_login_to_sheetdb(username)
-    if not ok:
+    # SheetDB me save karo
+    try:
+        sheetdb_res = save_login_to_sheetdb(username)
+    except Exception as e:
         return jsonify({
             "login": "failed",
             "reason": "sheetdb_error",
-            "details": info
+            "details": str(e)
         }), 500
 
     return jsonify({
         "login": "successful",
-        "username": username
+        "username": f"@{username}",
+        "sheetdb_response": sheetdb_res
     })
 
 
+# Render ke liye entrypoint
 if __name__ == "__main__":
-    # Local test ke liye
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
